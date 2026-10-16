@@ -6,18 +6,20 @@ import pandas as pd
 import numpy as np
 import random
 
+import os
+os.environ['TF_USE_LEGACY_KERAS'] = '1'   # must come before tensorflow is imported
+import sys, tf_keras
+sys.modules['keras'] = tf_keras           # old "from keras..." imports now use Keras 2 inside TF 2
 from keras.layers import Input, Embedding, LSTM, TimeDistributed, Dense, Bidirectional, Dropout
 from keras.models import Model, load_model
-
-from keras.layers.normalization import BatchNormalization
 from models import encoding
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+# os.environ["CUDA_VISIBLE_DEVICES"]="1" # commented out to not break the run
 np.random.seed(1)
 
-from tensorflow import set_random_seed
-set_random_seed(1)
+import tensorflow as tf
+tf.random.set_seed(1)
 
 def main(s):
     LEARNING_RATE=0.001
@@ -90,7 +92,9 @@ def main(s):
     print('training size', len(training_input))
     print('validation size', len(validation_input))
 
-    ration =range_of_val + 100
+    # ration =range_of_val + 100
+    TEST_N = 100000   # 100 = the authors' slice; 100000 = whole 10% test split
+    ration = range_of_val + TEST_N
     testing_input = data_input_uniq[range_of_val:ration]
     testing_output = data_output_uniq[range_of_val:ration]
 
@@ -140,7 +144,7 @@ def main(s):
 
     for i in range(NUMBER_OF_LAYERS):
         print("Adding LSTM #"+str(i)+" to Encoder")
-        encoder = LSTM(HIDDEN_NODES, return_sequences=True, unroll=True)(encoder)
+        encoder = LSTM(HIDDEN_NODES, return_sequences=True, unroll=True, recurrent_activation="hard_sigmoid")(encoder)
         #encoder = BatchNormalization()(encoder)
         encoder = Dropout(DROPOUT)(encoder)
     encoder_last = encoder[:,-1,:]
@@ -151,7 +155,7 @@ def main(s):
     decoder = Embedding(output_dict_size, EMB_SIZE, input_length=OUTPUT_LENGTH, mask_zero=True)(decoder_input)
     for i in range(NUMBER_OF_LAYERS):
         print("Adding LSTM #"+str(i)+" to Decoder")
-        decoder = LSTM(HIDDEN_NODES, return_sequences=True, unroll=True)(decoder, initial_state=[encoder_last, encoder_last])
+        decoder = LSTM(HIDDEN_NODES, return_sequences=True, unroll=True, recurrent_activation="hard_sigmoid")(decoder, initial_state=[encoder_last, encoder_last])
         #decoder= BatchNormalization()(decoder)
         decoder = Dropout(DROPOUT)(decoder)
 
@@ -179,12 +183,11 @@ def main(s):
     model = Model(inputs=[encoder_input, decoder_input], outputs=[output])
 
     from keras import optimizers
-    opt = optimizers.Adam(lr=LEARNING_RATE, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.0, amsgrad=False)
+    opt = optimizers.Adam(lr=LEARNING_RATE, beta_1=0.9, beta_2=0.999, amsgrad=False)
 
     model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
 
     training_encoder_input = encoded_training_input
-    import pdb; pdb.set_trace()
     training_decoder_input = np.zeros_like(encoded_training_output)
     training_decoder_input[:, 1:] = encoded_training_output[:,:-1]
     training_decoder_input[:, 0] = encoding.CHAR_CODE_START
@@ -200,8 +203,8 @@ def main(s):
     if os.path.isfile(saver_folder+'/model.h5'):
         model = load_model(saver_folder+'/model.h5')
     else:
-        history = model.fit(x=[training_encoder_input, training_decoder_input], y=[training_decoder_output],
-            validation_data=([validation_encoder_input, validation_decoder_input], [validation_decoder_output]),
+        history = model.fit(x=[training_encoder_input, training_decoder_input], y=training_decoder_output,
+            validation_data=([validation_encoder_input, validation_decoder_input], validation_decoder_output),
             verbose=2, batch_size=BATCH_SIZE, epochs=EPOCHS)
 
     #model.fit(x=[training_encoder_input, training_decoder_input], y=[training_decoder_output],
@@ -238,38 +241,68 @@ def main(s):
 
 
     print('testing size', len(testing_input))
+    # ref = open(saver_folder+"/ref.txt", "w")
+    # pred = open(saver_folder+"/pred.txt", "w")
+
+    # import sys
+    # sum_of_trues=0
+
+    # i=0
+    # for s,t in zip(testing_input,testing_output):
+    #     sys.stdout.write(str(i)+' ')
+    #     ref.write(" ".join(t)+"\n")
+    #     i+=1
+    #     p = to_arabic(s)
+    #     pred.write(" ".join(p)+"\n")
+    # # print(s,"=>",to_arabic(s), (to_arabic(s) == t))
+    #     if p == t:
+    #         sum_of_trues+=1
+
+    # res_file = open(saver_folder+"/results.txt", "w")
+    # res_file.write("Accuracy= "+str(sum_of_trues/(len(testing_input)) ))
+    # print("\nAccuracy=",sum_of_trues/(len(testing_input)))
+    # ref.close()
+    # pred.close()
+
+    # from bleu import moses_multi_bleu
+    # ref_arr = [i.strip() for i in open(saver_folder+"/ref.txt").readlines()]
+    # pred_arr = [i.strip() for i in open(saver_folder+"/pred.txt").readlines()]
+
+    # res_file.write("\nBleu= "+ str(moses_multi_bleu(ref_arr, pred_arr)))
+    # res_file.close()
+
+    def generate_batch(texts):
+        # same decoding as generate(), run on all words at once
+        enc_in = encoding.transform(input_encoding, [t.lower() for t in texts], INPUT_LENGTH)
+        dec_in = np.zeros(shape=(len(enc_in), OUTPUT_LENGTH))
+        dec_in[:,0] = encoding.CHAR_CODE_START
+        for i in range(1, OUTPUT_LENGTH):
+            output = model.predict([enc_in, dec_in], batch_size=256, verbose=0).argmax(axis=2)
+            dec_in[:,i] = output[:,i]
+        return dec_in[:,1:]
+
+    preds = [decode(output_decoding, row) for row in generate_batch(testing_input)]
     ref = open(saver_folder+"/ref.txt", "w")
     pred = open(saver_folder+"/pred.txt", "w")
-
-    import sys
-    sum_of_trues=0
-
-    i=0
-    for s,t in zip(testing_input,testing_output):
-        sys.stdout.write(str(i)+' ')
+    for t, p in zip(testing_output, preds):
         ref.write(" ".join(t)+"\n")
-        i+=1
-        p = to_arabic(s)
         pred.write(" ".join(p)+"\n")
-    # print(s,"=>",to_arabic(s), (to_arabic(s) == t))
-        if p == t:
-            sum_of_trues+=1
-
-    res_file = open(saver_folder+"/results.txt", "w")
-    res_file.write("Accuracy= "+str(sum_of_trues/(len(testing_input)) ))
-    print("\nAccuracy=",sum_of_trues/(len(testing_input)))
     ref.close()
     pred.close()
+
+    hits = [p == t for p, t in zip(preds, testing_output)]
+    acc_all = sum(hits) / len(hits)
+    acc_100 = sum(hits[:100]) / len(hits[:100])
+    print("\nAccuracy (first 100) =", acc_100, "| Accuracy (all", len(hits), ") =", acc_all)
 
     from bleu import moses_multi_bleu
     ref_arr = [i.strip() for i in open(saver_folder+"/ref.txt").readlines()]
     pred_arr = [i.strip() for i in open(saver_folder+"/pred.txt").readlines()]
-
-    res_file.write("\nBleu= "+ str(moses_multi_bleu(ref_arr, pred_arr)))
+    res_file = open(saver_folder+"/results.txt", "w")
+    res_file.write("Accuracy_first100= "+str(acc_100)+"\nAccuracy_all= "+str(acc_all))
+    res_file.write("\nBleu_first100= "+str(moses_multi_bleu(ref_arr[:100], pred_arr[:100])))
+    res_file.write("\nBleu_all= "+str(moses_multi_bleu(ref_arr, pred_arr)))
     res_file.close()
 
-i=51
-while (i<1000):
-    print("\n\nSeed",i)
-    main(i)
-    i+=2
+main(int(sys.argv[1])) # take seed from cmdline
+
