@@ -12,6 +12,7 @@ import sys, tf_keras
 sys.modules['keras'] = tf_keras           # old "from keras..." imports now use Keras 2 inside TF 2
 from keras.layers import Input, Embedding, LSTM, TimeDistributed, Dense, Bidirectional, Dropout
 from keras.models import Model, load_model
+from keras.layers import Layer
 from models import encoding
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   # see issue #152
@@ -20,6 +21,45 @@ np.random.seed(1)
 
 import tensorflow as tf
 tf.random.set_seed(1)
+
+class Attention(Layer):
+    """Luong et al. (2015) attention. kind: global | localp.  score: dot | general.
+    inputs: [decoder states (B,T,h), encoder states (B,S,h), source char ids (B,S)]
+    output: context vectors (B,T,h)"""
+    def __init__(self, kind="global", score="dot", D=3, **kw):
+        super(Attention, self).__init__(**kw)
+        self.kind, self.score, self.D = kind, score, D
+        self.supports_masking = True
+
+    def build(self, input_shapes):
+        h = input_shapes[0][-1]
+        if self.score == "general":
+            self.Wa = self.add_weight(name="Wa", shape=(h, h), initializer="glorot_uniform")
+        if self.kind == "localp":
+            self.Wp = self.add_weight(name="Wp", shape=(h, h), initializer="glorot_uniform")
+            self.vp = self.add_weight(name="vp", shape=(h, 1), initializer="glorot_uniform")
+        super(Attention, self).build(input_shapes)
+
+    def compute_mask(self, inputs, mask=None):
+        return None
+
+    def call(self, inputs):
+        dec, enc, src = inputs
+        q = dec if self.score == "dot" else tf.matmul(dec, self.Wa)       # general: h_t^T W h_s
+        scores = tf.einsum("btd,bsd->bts", q, enc)
+        if self.kind == "global":
+            w = tf.nn.softmax(scores, axis=-1)                            # same as the original lines
+        else:
+            valid = tf.cast(tf.not_equal(src, 0), scores.dtype)           # real characters, not padding
+            S = tf.reduce_sum(valid, axis=1)                              # true word length
+            p = S[:, None] * tf.sigmoid(tf.matmul(tf.tanh(tf.matmul(dec, self.Wp)), self.vp)[..., 0])
+            pos = tf.cast(tf.range(tf.shape(src)[1]), scores.dtype)[None, None, :]
+            dist = pos - p[:, :, None]                                    # distance to predicted centre
+            gauss = tf.exp(-tf.square(dist) / (2.0 * (self.D / 2.0) ** 2))
+            keep = tf.logical_and(tf.abs(dist) <= self.D, valid[:, None, :] > 0)
+            scores = tf.where(keep, scores, tf.constant(-1e9, scores.dtype))
+            w = tf.nn.softmax(scores, axis=-1) * gauss
+        return tf.einsum("bts,bsd->btd", w, enc)
 
 def main(s):
     LEARNING_RATE=0.001
@@ -32,9 +72,12 @@ def main(s):
     OPT = "adam"
     BI = "No"
     DROPOUT = 0.2
+    ATTN = "global"   # global | localp
+    SCORE = "dot"     # dot | general
+    D = 3             # local-p half-window
     SEED=s
 
-    saver_folder = "logs/Model_check_seed_"+str(SEED)+"_lr_"+str(LEARNING_RATE)+"_batch_"+str(BATCH_SIZE)+"_node_"+str(HIDDEN_NODES)+"_l_"+str(NUMBER_OF_LAYERS)+"_emb_"+str(EMB_SIZE)+"_ep_"+str(EPOCHS)+"_loss_"+LOSS+"_opt_"+OPT+"_bi_"+BI+"_dropout_"+str(DROPOUT)
+    saver_folder = "logs/Model_check_seed_"+str(SEED)+"_lr_"+str(LEARNING_RATE)+"_batch_"+str(BATCH_SIZE)+"_node_"+str(HIDDEN_NODES)+"_l_"+str(NUMBER_OF_LAYERS)+"_emb_"+str(EMB_SIZE)+"_ep_"+str(EPOCHS)+"_loss_"+LOSS+"_opt_"+OPT+"_bi_"+BI+"_dropout_"+str(DROPOUT)+"_attn_"+ATTN+"_"+SCORE+"_D"+str(D)
     if not os.path.exists(saver_folder):
             os.makedirs(saver_folder)
 
@@ -165,11 +208,12 @@ def main(s):
 
     # Equation (7) with 'dot' score from Section 3.1 in the paper.
     # Note that we reuse Softmax-activation layer instead of writing tensor calculation
-    attention = dot([decoder, encoder], axes=[2, 2])
-    attention = Activation('softmax', name='attention')(attention)
-    print('attention', attention)
+    # attention = dot([decoder, encoder], axes=[2, 2])
+    # attention = Activation('softmax', name='attention')(attention)
+    # print('attention', attention)
 
-    context = dot([attention, encoder], axes=[2,1])
+    # context = dot([attention, encoder], axes=[2,1])
+    context = Attention(ATTN, SCORE, D, name='attention')([decoder, encoder, encoder_input])
     print('context', context)
 
     decoder_combined_context = concatenate([context, decoder])
