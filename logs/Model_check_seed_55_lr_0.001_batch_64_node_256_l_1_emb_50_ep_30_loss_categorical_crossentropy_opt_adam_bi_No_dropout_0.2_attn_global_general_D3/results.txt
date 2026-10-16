@@ -1,0 +1,4 @@
+Accuracy_first100= 0.63
+Accuracy_all= 0.65650826446281
+Bleu_first100= 78.57
+Bleu_all= 81.61

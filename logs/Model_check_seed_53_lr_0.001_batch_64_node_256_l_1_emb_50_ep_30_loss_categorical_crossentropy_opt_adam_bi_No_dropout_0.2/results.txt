@@ -1,0 +1,2 @@
+Accuracy_first100= 0.67
+Accuracy_all= 0.6291322314049587
