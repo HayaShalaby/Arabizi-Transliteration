@@ -26,18 +26,21 @@ class Attention(Layer):
     """Luong et al. (2015) attention. kind: global | localp.  score: dot | general.
     inputs: [decoder states (B,T,h), encoder states (B,S,h), source char ids (B,S)]
     output: context vectors (B,T,h)"""
-    def __init__(self, kind="global", score="dot", D=3, **kw):
+    def __init__(self, kind="global", score="dot", D=3, Ds=(2, 3, 5), **kw):
         super(Attention, self).__init__(**kw)
         self.kind, self.score, self.D = kind, score, D
+        self.Ds = Ds
         self.supports_masking = True
 
     def build(self, input_shapes):
         h = input_shapes[0][-1]
         if self.score == "general":
             self.Wa = self.add_weight(name="Wa", shape=(h, h), initializer="glorot_uniform")
-        if self.kind == "localp":
+        if self.kind in ("localp", "multip"):
             self.Wp = self.add_weight(name="Wp", shape=(h, h), initializer="glorot_uniform")
             self.vp = self.add_weight(name="vp", shape=(h, 1), initializer="glorot_uniform")
+        if self.kind == "multip":
+            self.alpha = self.add_weight(name="alpha", shape=(len(self.Ds),), initializer="zeros")
         super(Attention, self).build(input_shapes)
 
     def compute_mask(self, inputs, mask=None):
@@ -52,13 +55,26 @@ class Attention(Layer):
         else:
             valid = tf.cast(tf.not_equal(src, 0), scores.dtype)           # real characters, not padding
             S = tf.reduce_sum(valid, axis=1)                              # true word length
-            p = S[:, None] * tf.sigmoid(tf.matmul(tf.tanh(tf.matmul(dec, self.Wp)), self.vp)[..., 0])
+            if self.kind == "localm":
+                t = tf.maximum(tf.cast(tf.range(tf.shape(dec)[1]), scores.dtype) - 1.0, 0.0)
+                p = tf.minimum(t[None, :], (S - 1.0)[:, None])
+            else:
+                p = S[:, None] * tf.sigmoid(tf.matmul(tf.tanh(tf.matmul(dec, self.Wp)), self.vp)[..., 0])
             pos = tf.cast(tf.range(tf.shape(src)[1]), scores.dtype)[None, None, :]
             dist = pos - p[:, :, None]                                    # distance to predicted centre
-            gauss = tf.exp(-tf.square(dist) / (2.0 * (self.D / 2.0) ** 2))
-            keep = tf.logical_and(tf.abs(dist) <= self.D, valid[:, None, :] > 0)
-            scores = tf.where(keep, scores, tf.constant(-1e9, scores.dtype))
-            w = tf.nn.softmax(scores, axis=-1) * gauss
+            Ds = [self.D] if self.kind in ("localp", "localm") else list(self.Ds)
+            ws = []
+            for d in Ds:
+                gauss = tf.exp(-tf.square(dist) / (2.0 * (d / 2.0) ** 2))
+                keep = tf.logical_and(tf.abs(dist) <= d, valid[:, None, :] > 0)
+                sc = tf.where(keep, scores, tf.constant(-1e9, scores.dtype))
+                wt = tf.nn.softmax(sc, axis=-1)
+                ws.append(wt if self.kind == "localm" else wt * gauss)
+            if len(ws) == 1:
+                w = ws[0]
+            else:
+                a = tf.nn.softmax(self.alpha)
+                w = tf.add_n([a[k] * ws[k] for k in range(len(ws))])
         return tf.einsum("bts,bsd->btd", w, enc)
 
 def main(s):
@@ -67,14 +83,14 @@ def main(s):
     HIDDEN_NODES = 256
     NUMBER_OF_LAYERS = 1
     EMB_SIZE= 50
-    EPOCHS= 30
+    EPOCHS= int(os.environ.get("EPOCHS", 30))
     LOSS="categorical_crossentropy"
     OPT = "adam"
-    BI = "No"
+    BI = os.environ.get("BI", "No")
     DROPOUT = 0.2
-    ATTN = "global"   # global | localp
-    SCORE = "dot"     # dot | general
-    D = 3             # local-p half-window
+    ATTN = os.environ.get("ATTN", "global")   # global | localp | multip
+    SCORE = os.environ.get("SCORE", "dot")
+    D = int(os.environ.get("D", 3))
     SEED=s
 
     saver_folder = "logs/Model_check_seed_"+str(SEED)+"_lr_"+str(LEARNING_RATE)+"_batch_"+str(BATCH_SIZE)+"_node_"+str(HIDDEN_NODES)+"_l_"+str(NUMBER_OF_LAYERS)+"_emb_"+str(EMB_SIZE)+"_ep_"+str(EPOCHS)+"_loss_"+LOSS+"_opt_"+OPT+"_bi_"+BI+"_dropout_"+str(DROPOUT)+"_attn_"+ATTN+"_"+SCORE+"_D"+str(D)
